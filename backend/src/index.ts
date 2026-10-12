@@ -1,0 +1,213 @@
+import express from 'express';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import { v4 as uuidv4 } from 'uuid';
+import { processInstruction, getGreeting } from './services/agentService.js';
+import type {
+  ClientMessage,
+  ServerMessage,
+  Session,
+  WorkspaceState,
+  ScribeResponse,
+} from './types/index.js';
+
+// In-memory session storage (use Redis in production)
+const sessions = new Map<string, Session>();
+
+// Express app for health checks and HTTP endpoints
+const app = express();
+app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    sessions: sessions.size,
+  });
+});
+
+// Create HTTP server
+const server = createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+/**
+ * Send a message to a WebSocket client
+ */
+function sendMessage(ws: WebSocket, message: ServerMessage): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+/**
+ * Create or get a session
+ */
+function getOrCreateSession(sessionId?: string): Session {
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId)!;
+    session.lastActivity = new Date();
+    return session;
+  }
+
+  const newSession: Session = {
+    id: uuidv4(),
+    createdAt: new Date(),
+    lastActivity: new Date(),
+    workspaceState: {
+      items: [],
+      graphState: { points: [], lines: [], functions: [] },
+    },
+  };
+
+  sessions.set(newSession.id, newSession);
+  return newSession;
+}
+
+/**
+ * Handle WebSocket connection
+ */
+wss.on('connection', (ws: WebSocket) => {
+  // Set up ping/pong keep-alive to prevent Cloud Run idle timeout
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  }, 25000);
+
+  // Create new session and send init message
+  const session = getOrCreateSession();
+
+  sendMessage(ws, {
+    type: 'session_init',
+    sessionId: session.id,
+    payload: { text: '' } as ScribeResponse,
+  });
+
+  // Send initial greeting
+  sendMessage(ws, {
+    type: 'scribe_response',
+    sessionId: session.id,
+    payload: getGreeting(),
+  });
+
+  // Handle incoming messages
+  ws.on('message', async (data: Buffer) => {
+    try {
+      const message: ClientMessage = JSON.parse(data.toString());
+      const currentSession = getOrCreateSession(message.sessionId);
+
+      switch (message.type) {
+        case 'instruction': {
+          if (!message.payload.instruction) {
+            sendMessage(ws, {
+              type: 'error',
+              sessionId: currentSession.id,
+              payload: { message: 'No instruction provided' },
+            });
+            return;
+          }
+
+          // Update workspace state if provided
+          if (message.payload.workspaceState) {
+            // Ensure timestamps are Date objects
+            if (message.payload.workspaceState.items) {
+              message.payload.workspaceState.items.forEach(item => {
+                if (typeof item.timestamp === 'string') {
+                  item.timestamp = new Date(item.timestamp);
+                }
+              });
+            }
+            currentSession.workspaceState = message.payload.workspaceState;
+          }
+
+          // Send processing indicator
+          sendMessage(ws, {
+            type: 'processing',
+            sessionId: currentSession.id,
+            payload: { text: 'Thinking...' } as ScribeResponse,
+          });
+
+          // Process instruction with Claude
+          const conversationHistory = message.payload.conversationHistory || [];
+          for await (const response of processInstruction(
+            message.payload.instruction,
+            currentSession.workspaceState,
+            conversationHistory
+          )) {
+            sendMessage(ws, {
+              type: 'scribe_response',
+              sessionId: currentSession.id,
+              payload: response,
+            });
+          }
+
+          // End of stream. Separate from the scribe's `finished` flag, which means
+          // the student declared their final answer.
+          sendMessage(ws, {
+            type: 'done',
+            sessionId: currentSession.id,
+            payload: { text: '' } as ScribeResponse,
+          });
+          break;
+        }
+
+        case 'new_session': {
+          // Create a fresh session
+          const newSession = getOrCreateSession();
+          sendMessage(ws, {
+            type: 'session_init',
+            sessionId: newSession.id,
+            payload: { text: '' } as ScribeResponse,
+          });
+
+          // Send greeting for new session
+          sendMessage(ws, {
+            type: 'scribe_response',
+            sessionId: newSession.id,
+            payload: getGreeting(),
+          });
+          break;
+        }
+
+        default:
+          console.warn('Unknown message type:', message.type);
+      }
+    } catch (error) {
+      console.error('Message handling error:', error);
+      sendMessage(ws, {
+        type: 'error',
+        sessionId: '',
+        payload: { message: 'Failed to process message' },
+      });
+    }
+  });
+
+  ws.on('close', () => {
+    clearInterval(pingInterval);
+  });
+
+  ws.on('error', () => {
+    clearInterval(pingInterval);
+  });
+});
+
+// Clean up old sessions periodically (every 30 minutes)
+setInterval(
+  () => {
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000); // 1 hour
+    for (const [id, session] of sessions) {
+      if (session.lastActivity < cutoff) {
+        sessions.delete(id);
+      }
+    }
+  },
+  30 * 60 * 1000
+);
+
+// Start server
+const PORT = parseInt(process.env.PORT || '8080', 10);
+server.listen(PORT, () => {
+  console.log(`Math Scribe backend running on port ${PORT}`);
+});
