@@ -1,0 +1,8 @@
+{
+  "hosting": {
+    "public": "public",
+    "redirects": [
+      { "source": "**", "destination": "https://danielburkhalter.dev/math-scribe/", "type": 301 }
+    ]
+  }
+}

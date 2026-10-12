@@ -174,3 +174,7 @@ gcloud run services describe math-scribe-backend --region us-central1 --format="
 - **Backend:** https://math-scribe-backend-bae5znb3dq-uc.a.run.app
 - **Firebase Console:** https://console.firebase.google.com/project/math-scribe-3a4b6
 - **Cloud Run Console:** https://console.cloud.google.com/run?project=math-scribe-3a4b6
+
+## Old Firebase URL
+
+`math-scribe-3a4b6.web.app` 301-redirects to `danielburkhalter.dev/math-scribe/` (config in `firebase-redirect/`). Don't deploy the app to Firebase Hosting. Leave Hosting enabled, because Firebase Auth's sign-in popup is served from `math-scribe-3a4b6.firebaseapp.com/__/auth/`. To change the redirect: `cd firebase-redirect; firebase deploy --only hosting`.
